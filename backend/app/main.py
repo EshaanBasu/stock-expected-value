@@ -11,9 +11,10 @@ load_dotenv()
 
 app = FastAPI(title="Stock Return Predictor API")
 
+_raw_origins = os.environ.get("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=[o.strip() for o in _raw_origins.split(",")],
     allow_methods=["*"],
     allow_headers=["*"],
 )
