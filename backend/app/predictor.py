@@ -5,19 +5,17 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
 
 from .polygon_client import fetch_daily_bars
-from .features import compute_features, build_sequences
-from .lstm_model import StockLSTM, train_model, predict
-
-SEQ_LEN = 30
+from .return_model import predict_annual_return
+from .portfolio import estimate_covariance, search_optimal_portfolios
 
 
 @dataclass
 class Job:
     id: str
-    ticker: str
+    tickers: list[str]
+    k: int
     horizon_days: int
     status: str = "queued"
     progress: float = 0.0
@@ -30,9 +28,9 @@ class Job:
 _jobs: dict[str, Job] = {}
 
 
-def create_job(ticker: str, horizon_days: int) -> str:
+def create_job(tickers: list[str], k: int, horizon_days: int) -> str:
     job_id = str(uuid.uuid4())
-    _jobs[job_id] = Job(id=job_id, ticker=ticker, horizon_days=horizon_days)
+    _jobs[job_id] = Job(id=job_id, tickers=tickers, k=k, horizon_days=horizon_days)
     return job_id
 
 
@@ -40,7 +38,7 @@ def get_job(job_id: str) -> Optional[Job]:
     return _jobs.get(job_id)
 
 
-async def run_prediction_job(job_id: str, api_key: str) -> None:
+async def run_optimization_job(job_id: str, api_key: str) -> None:
     import asyncio
 
     job = _jobs[job_id]
@@ -48,22 +46,22 @@ async def run_prediction_job(job_id: str, api_key: str) -> None:
 
     try:
         job.status = "fetching"
-        job.message = f"Fetching 2 years of daily data for {job.ticker}..."
-        bars = await fetch_daily_bars(job.ticker, days=730, api_key=api_key)
+        job.message = f"Fetching 2 years of data for {len(job.tickers)} tickers..."
 
-        if len(bars) < 100:
-            raise ValueError(
-                f"Only {len(bars)} trading days available — need at least 100."
-            )
+        bars_by_ticker: dict[str, list[dict]] = {}
+        for i, ticker in enumerate(job.tickers):
+            job.message = f"Fetching {ticker} ({i + 1}/{len(job.tickers)})..."
+            job.progress = 0.05 + 0.30 * (i / len(job.tickers))
+            bars = await fetch_daily_bars(ticker, days=730, api_key=api_key)
+            if len(bars) < 100:
+                raise ValueError(f"{ticker}: only {len(bars)} trading days available.")
+            bars_by_ticker[ticker] = bars
 
-        df = pd.DataFrame(bars).set_index("date")
-        df.index = pd.to_datetime(df.index)
-        df = df.astype(float)
+        job.status = "optimizing"
+        job.message = "Running portfolio optimization..."
+        job.progress = 0.35
 
-        job.status = "training"
-        job.message = "Computing technical indicators..."
-
-        result = await loop.run_in_executor(None, _train_and_predict, job, df)
+        result = await loop.run_in_executor(None, _optimize, job, bars_by_ticker)
 
         job.status = "complete"
         job.result = result
@@ -76,73 +74,56 @@ async def run_prediction_job(job_id: str, api_key: str) -> None:
         job.message = f"Error: {exc}"
 
 
-def _train_and_predict(job: Job, df: pd.DataFrame) -> dict:
+def _optimize(job: Job, bars_by_ticker: dict[str, list[dict]]) -> dict:
+    tickers = job.tickers
     horizon = job.horizon_days
-    close = df["close"]
 
-    feat_df = compute_features(df)
-    log_label = np.log(close.shift(-horizon) / close) * (252.0 / horizon)
+    # Build aligned price DataFrame
+    dfs = {}
+    for ticker, bars in bars_by_ticker.items():
+        df = pd.DataFrame(bars).set_index("date")
+        df.index = pd.to_datetime(df.index)
+        dfs[ticker] = df["close"].astype(float)
 
-    combined = pd.concat([feat_df, log_label.rename("label")], axis=1).dropna()
+    prices = pd.DataFrame(dfs).sort_index().dropna()
+    if len(prices) < 100:
+        raise ValueError("Not enough overlapping trading days across all tickers.")
 
-    if len(combined) < SEQ_LEN + 30:
-        raise ValueError(
-            f"Not enough clean data ({len(combined)} rows) after computing indicators."
-        )
+    # Daily log returns matrix
+    log_ret = np.log(prices / prices.shift(1)).dropna().values  # shape (T, n)
 
-    feature_cols = [c for c in combined.columns if c != "label"]
-    X_raw = combined[feature_cols].values.astype(np.float32)
-    y_raw = combined["label"].values.astype(np.float32)
+    # ML: Ridge regression predicts expected annualized return per ticker
+    job.message = "Predicting expected returns (Ridge regression)..."
+    mean_returns = np.array([
+        predict_annual_return(prices[t], horizon_days=horizon)
+        for t in tickers
+    ], dtype=np.float64)
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_raw)
+    # Ledoit-Wolf shrinkage covariance estimate
+    job.message = "Estimating covariance matrix (Ledoit-Wolf)..."
+    cov = estimate_covariance(log_ret)
 
-    # Clip label outliers at ±3 std so extreme events don't dominate the loss
-    y_mean, y_std = y_raw.mean(), y_raw.std()
-    y_clipped = np.clip(y_raw, y_mean - 3 * y_std, y_mean + 3 * y_std)
+    import math
+    n, k = len(tickers), job.k
+    n_combos = math.comb(n, k)
+    job.message = f"Searching {n_combos} combinations of {k} assets..."
 
-    X_seq, y_seq = build_sequences(X_scaled, y_clipped, seq_len=SEQ_LEN)
+    top_portfolios = search_optimal_portfolios(tickers, mean_returns, cov, log_ret, k)
 
-    split = int(len(X_seq) * 0.8)
-    X_train, y_train = X_seq[:split], y_seq[:split]
-    X_val = X_seq[split:] if split < len(X_seq) else X_seq[-10:]
-    y_val = y_seq[split:] if split < len(y_seq) else y_seq[-10:]
-
-    def _progress(epoch: int, total: int, train_loss: float, val_loss: float) -> None:
-        job.progress = epoch / total
-        job.message = f"Training epoch {epoch}/{total} — val loss {val_loss:.5f}"
-
-    model = train_model(X_train, y_train, X_val, y_val, progress_callback=_progress)
-
-    log_ann_return = predict(model, X_scaled[-SEQ_LEN:])
-    ann_return = float(np.expm1(log_ann_return))
-
-    hist_log = y_raw[-252:] if len(y_raw) >= 252 else y_raw
-    hist_simple = np.expm1(hist_log)
-
-    # Risk metrics
-    daily_log_returns = np.log(close / close.shift(1)).dropna()
-    ann_volatility = float(daily_log_returns.std() * np.sqrt(252))
-    sharpe_ratio = round(ann_return / ann_volatility, 3) if ann_volatility > 0 else 0.0
-    rolling_max = close.cummax()
-    max_drawdown = float(((close - rolling_max) / rolling_max).min())
-
-    price_history = [
-        {"date": str(idx.date()), "close": round(float(val), 2)}
-        for idx, val in zip(df.index[-365:], close.iloc[-365:])
-    ]
+    # Recent 1-year price history for each ticker (for charting)
+    price_history = {
+        t: [
+            {"date": str(idx.date()), "close": round(float(val), 2)}
+            for idx, val in prices[t].iloc[-252:].items()
+        ]
+        for t in tickers
+    }
 
     return {
-        "ticker": job.ticker,
-        "horizon_days": horizon,
-        "predicted_annualized_return": round(ann_return, 4),
-        "historical_median_return": round(float(np.median(hist_simple)), 4),
-        "historical_std": round(float(np.std(hist_simple)), 4),
-        "current_price": round(float(close.iloc[-1]), 2),
-        "annualized_volatility": round(ann_volatility, 4),
-        "sharpe_ratio": round(sharpe_ratio, 3),
-        "max_drawdown": round(max_drawdown, 4),
-        "data_points": len(combined),
-        "training_samples": len(X_train),
+        "tickers": tickers,
+        "k": k,
+        "n_combinations_searched": n_combos,
+        "expected_returns": {t: round(float(r), 4) for t, r in zip(tickers, mean_returns)},
+        "top_portfolios": top_portfolios,
         "price_history": price_history,
     }

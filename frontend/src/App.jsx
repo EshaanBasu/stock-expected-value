@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { startPrediction, getPredictionStatus } from "./api";
+import { startOptimization, getOptimizationStatus } from "./api";
 import SearchForm from "./components/SearchForm";
-import PredictionCard from "./components/PredictionCard";
+import PortfolioCard from "./components/PortfolioCard";
 
-const POLL_INTERVAL_MS = 2000;
+const POLL_MS = 2000;
 
 export default function App() {
   const [loading, setLoading] = useState(false);
@@ -20,33 +20,31 @@ export default function App() {
 
   useEffect(() => () => stopPolling(), []);
 
-  async function handleSubmit(ticker, horizonDays) {
+  async function handleSubmit(tickers, k, horizonDays) {
     stopPolling();
     setError(null);
     setJobStatus(null);
     setLoading(true);
 
     try {
-      const { job_id } = await startPrediction(ticker, horizonDays);
+      const { job_id } = await startOptimization(tickers, k, horizonDays);
 
       pollRef.current = setInterval(async () => {
         try {
-          const status = await getPredictionStatus(job_id);
+          const status = await getOptimizationStatus(job_id);
           setJobStatus(status);
 
           if (status.status === "complete" || status.status === "error") {
             stopPolling();
             setLoading(false);
-            if (status.status === "error") {
-              setError(status.error ?? "Prediction failed.");
-            }
+            if (status.status === "error") setError(status.error ?? "Optimization failed.");
           }
         } catch (err) {
           stopPolling();
           setLoading(false);
           setError(err.message);
         }
-      }, POLL_INTERVAL_MS);
+      }, POLL_MS);
     } catch (err) {
       setLoading(false);
       setError(err.message);
@@ -57,11 +55,11 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-900 text-white">
-      <div className="max-w-2xl mx-auto px-4 py-12">
+      <div className="max-w-3xl mx-auto px-4 py-12">
         <header className="mb-10">
-          <h1 className="text-3xl font-bold text-white">Stock Return Predictor</h1>
+          <h1 className="text-3xl font-bold text-white">Portfolio Optimizer</h1>
           <p className="text-slate-400 mt-2 text-sm">
-            LSTM deep learning · 2 years of daily OHLCV data · Polygon.io
+            ML-driven combinatorial search · Ridge regression returns · Ledoit-Wolf covariance · Max-Sharpe weights
           </p>
         </header>
 
@@ -70,7 +68,7 @@ export default function App() {
         </div>
 
         {loading && jobStatus && (
-          <div className="bg-slate-800 rounded-2xl p-6 mb-6">
+          <div className="bg-slate-800 rounded-2xl p-5 mb-6">
             <div className="flex justify-between items-center mb-2">
               <span className="text-sm text-slate-300">{jobStatus.message}</span>
               <span className="text-sm font-mono text-emerald-400">{progressPct}%</span>
@@ -78,7 +76,7 @@ export default function App() {
             <div className="w-full bg-slate-700 rounded-full h-2">
               <div
                 className="bg-emerald-500 h-2 rounded-full transition-all duration-300"
-                style={{ width: `${Math.max(progressPct, 4)}%` }}
+                style={{ width: `${Math.max(progressPct, 3)}%` }}
               />
             </div>
           </div>
@@ -92,7 +90,7 @@ export default function App() {
 
         {jobStatus?.status === "complete" && jobStatus.result && (
           <div className="bg-slate-800 rounded-2xl p-6">
-            <PredictionCard result={jobStatus.result} />
+            <PortfolioCard result={jobStatus.result} />
           </div>
         )}
       </div>
