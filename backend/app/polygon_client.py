@@ -1,56 +1,45 @@
-import os
+import asyncio
 from datetime import date, timedelta
 from typing import Optional
 
-import httpx
-
-POLYGON_BASE_URL = "https://api.polygon.io"
+import pandas as pd
+import yfinance as yf
 
 
 async def fetch_daily_bars(
     ticker: str,
     days: int = 730,
-    api_key: Optional[str] = None,
+    api_key: Optional[str] = None,  # unused — kept for interface compatibility
 ) -> list[dict]:
-    if api_key is None:
-        api_key = os.environ.get("POLYGON_API_KEY", "")
+    return await asyncio.to_thread(_fetch_sync, ticker.upper(), days)
 
-    end_date = date.today().isoformat()
-    start_date = (date.today() - timedelta(days=days)).isoformat()
 
-    url = (
-        f"{POLYGON_BASE_URL}/v2/aggs/ticker/{ticker.upper()}"
-        f"/range/1/day/{start_date}/{end_date}"
+def _fetch_sync(ticker: str, days: int) -> list[dict]:
+    start = (date.today() - timedelta(days=days)).isoformat()
+    end = date.today().isoformat()
+
+    df = yf.Ticker(ticker).history(
+        start=start,
+        end=end,
+        interval="1d",
+        auto_adjust=True,
     )
-    params = {
-        "adjusted": "true",
-        "sort": "asc",
-        "limit": 50000,
-        "apiKey": api_key,
-    }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
-
-    if data.get("status") == "ERROR":
-        raise ValueError(f"Polygon API error: {data.get('error', 'Unknown error')}")
-
-    if not data.get("results"):
+    if df.empty:
         raise ValueError(
-            f"No data found for '{ticker}'. Check the ticker symbol and ensure "
-            "your Polygon.io free-tier account has access."
+            f"No data found for '{ticker}'. Check the ticker symbol."
         )
+
+    df = df.dropna(subset=["Close"])
 
     return [
         {
-            "date": date.fromtimestamp(r["t"] / 1000).isoformat(),
-            "open": r["o"],
-            "high": r["h"],
-            "low": r["l"],
-            "close": r["c"],
-            "volume": r["v"],
+            "date": str(idx.date()),
+            "open": float(row["Open"]),
+            "high": float(row["High"]),
+            "low": float(row["Low"]),
+            "close": float(row["Close"]),
+            "volume": float(row["Volume"]),
         }
-        for r in data["results"]
+        for idx, row in df.iterrows()
     ]

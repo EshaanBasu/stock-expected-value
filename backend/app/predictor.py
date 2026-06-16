@@ -48,14 +48,18 @@ async def run_optimization_job(job_id: str, api_key: str) -> None:
         job.status = "fetching"
         job.message = f"Fetching 2 years of data for {len(job.tickers)} tickers..."
 
-        bars_by_ticker: dict[str, list[dict]] = {}
-        for i, ticker in enumerate(job.tickers):
-            job.message = f"Fetching {ticker} ({i + 1}/{len(job.tickers)})..."
-            job.progress = 0.05 + 0.30 * (i / len(job.tickers))
-            bars = await fetch_daily_bars(ticker, days=730, api_key=api_key)
+        n = len(job.tickers)
+        job.message = f"Fetching 2 years of data for {n} tickers (concurrent)…"
+        job.progress = 0.10
+
+        async def fetch_one(ticker: str) -> tuple[str, list[dict]]:
+            bars = await fetch_daily_bars(ticker, days=730)
             if len(bars) < 100:
                 raise ValueError(f"{ticker}: only {len(bars)} trading days available.")
-            bars_by_ticker[ticker] = bars
+            return ticker, bars
+
+        pairs = await asyncio.gather(*[fetch_one(t) for t in job.tickers])
+        bars_by_ticker: dict[str, list[dict]] = dict(pairs)
 
         job.status = "optimizing"
         job.message = "Running portfolio optimization..."

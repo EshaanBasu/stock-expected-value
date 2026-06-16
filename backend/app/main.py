@@ -33,16 +33,12 @@ def health():
 
 @app.post("/api/optimize", status_code=202)
 async def start_optimization(req: OptimizeRequest, background_tasks: BackgroundTasks):
-    api_key = os.environ.get("POLYGON_API_KEY", "")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="POLYGON_API_KEY is not configured.")
-
     tickers = [t.upper().strip() for t in req.tickers]
     if len(tickers) < req.k:
         raise HTTPException(status_code=400, detail=f"Need at least {req.k} tickers to form a {req.k}-asset portfolio.")
 
     job_id = create_job(tickers, req.k, req.horizon_days)
-    background_tasks.add_task(run_optimization_job, job_id, api_key)
+    background_tasks.add_task(run_optimization_job, job_id, "")
     return {"job_id": job_id}
 
 
